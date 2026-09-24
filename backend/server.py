@@ -27,6 +27,7 @@ from admin_router import (
     admin_router, sec_router,
     get_platform_settings, add_to_pool, is_network_enabled, check_user_2fa,
 )
+import aml as aml_mod
 import uuid
 
 logging.basicConfig(level=logging.INFO)
@@ -964,30 +965,51 @@ async def deposit_worker():
         await asyncio.sleep(20)
 
 
-async def _confirm_payment(inv, iso, nid, amount, address, status, sid):
+async def _confirm_payment(inv, iso, nid, amount, address, status, sid, from_address=None):
     already = await db.invoices.find_one({"id": inv["id"]}, {"status": 1})
     if already and already.get("status") in ("Paid", "Completed", "Overpayment"):
         return
+    # AML screening on the sender (if we can detect it, best-effort)
+    aml_result = await aml_mod.check_deposit_aml(from_address or "", amount, iso, nid)
+    if aml_result.get("action") == "BLOCK":
+        logger.warning(f"AML BLOCK deposit inv={inv['id']} from={from_address}: {aml_result}")
+        await db.invoices.update_one({"id": inv["id"]}, {"$set": {
+            "status": "Blocked", "status_id": 8, "aml": aml_result,
+            "amount_paid": amount}})
+        # Record a blocked transaction so admin sees it
+        await add_transaction(inv["user_id"], "deposit_blocked", iso, nid, 0,
+                              status="Blocked", address=address, txid="onchain",
+                              description=f"BLOCKED by AML ({', '.join(aml_result.get('flags', []))})",
+                              invoice_id=inv["id"], order_id=inv["order_id"],
+                              fee=0, fee_iso=iso, gross_amount=float(amount),
+                              source="cabinet")
+        return
+    review_hold = aml_result.get("action") == "REVIEW"
     # Deduct platform deposit fee (e.g. 0.5 USDT flat) from the incoming amount.
     plat = await get_platform_settings()
     plat_fee = float(plat.get("deposit_fee") or 0.0)
     net_amount = max(0.0, round(float(amount) - plat_fee, 8))
     fee_applied = round(float(amount) - net_amount, 8)
-    await credit_balance(inv["user_id"], iso, net_amount)
+    if not review_hold:
+        await credit_balance(inv["user_id"], iso, net_amount)
     if fee_applied > 0:
         await add_to_pool(iso, fee_applied)
-    await add_transaction(inv["user_id"], "deposit", iso, nid, net_amount, status="Done",
+    tx_status = "Review" if review_hold else "Done"
+    await add_transaction(inv["user_id"], "deposit", iso, nid, net_amount, status=tx_status,
                           address=address, txid="onchain",
-                          description=f"Deposit Invoice #{inv['id']} (gross {amount} {iso}, fee {fee_applied} {iso})",
+                          description=f"Deposit Invoice #{inv['id']} (gross {amount} {iso}, fee {fee_applied} {iso})"
+                                      + (" — ON HOLD by AML" if review_hold else ""),
                           invoice_id=inv["id"], order_id=inv["order_id"],
                           fee=fee_applied, fee_iso=iso, gross_amount=float(amount),
                           source="cabinet")
     await db.invoices.update_one({"id": inv["id"]}, {"$set": {
-        "status": status, "status_id": sid, "amount_paid": amount,
+        "status": ("Hold" if review_hold else status),
+        "status_id": (9 if review_hold else sid),
+        "amount_paid": amount, "aml": aml_result,
         "usd_value": round(amount * PRICES_USD.get(iso, 0.0), 2)}})
-    inv["status"] = status
+    inv["status"] = "Hold" if review_hold else status
     merchant = await db.merchants.find_one({"merchant_id": inv["merchant_id"]}, {"_id": 0})
-    if merchant:
+    if merchant and not review_hold:
         await send_webhook(merchant, inv, iso, amount)
         if merchant.get("auto_swap"):
             asyncio.create_task(_auto_swap(inv, merchant, iso, address))
@@ -1123,6 +1145,7 @@ async def startup():
         logger.info(f"cred write failed: {e}")
     asyncio.create_task(expire_worker())
     asyncio.create_task(deposit_worker())
+    asyncio.create_task(aml_mod.aml_refresh_worker())
 
 
 @app.on_event("shutdown")

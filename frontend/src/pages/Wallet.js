@@ -43,7 +43,7 @@ export default function Wallet() {
     api.get("/admin/platform-fees/public").then((r) => setPlatform(r.data.data)).catch(() => {});
     api.get("/admin/networks/public").then((r) => setNetMap(r.data.data)).catch(() => {});
   };
-  useEffect(load, []);
+  useEffect(() => { load(); }, []);
 
   // deposit
   const [dCur, setDCur] = useState("USDT");

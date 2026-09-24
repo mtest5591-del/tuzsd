@@ -1,29 +1,43 @@
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
+import { ShieldCheck } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import { useLang } from "@/lib/i18n";
-import { apiErr } from "@/lib/api";
+import api, { setToken, apiErr } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 
 export default function Login() {
-  const { login, register } = useAuth();
+  const { register, setUser } = useAuth();
   const { t, lang, setLang } = useLang();
   const navigate = useNavigate();
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
+  const [otp, setOtp] = useState("");
+  const [needs2FA, setNeeds2FA] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const doLogin = async (e) => {
     e.preventDefault();
     setBusy(true);
-    try { await login(email, password); navigate("/dashboard"); }
-    catch (err) { toast.error(apiErr(err)); }
-    finally { setBusy(false); }
+    try {
+      const { data } = await api.post("/auth/login", { email, password, otp: otp || undefined });
+      setToken(data.access_token);
+      setUser && setUser(data.user);
+      navigate("/dashboard");
+    } catch (err) {
+      const detail = err?.response?.data?.detail;
+      if (detail && typeof detail === "object" && (detail.error === "2FA_REQUIRED" || detail.error === "2FA_INVALID")) {
+        setNeeds2FA(true);
+        toast.info(detail.message || "Введіть код Google Authenticator");
+      } else {
+        toast.error(apiErr(err));
+      }
+    } finally { setBusy(false); }
   };
   const doRegister = async (e) => {
     e.preventDefault();
@@ -71,6 +85,12 @@ export default function Login() {
                 <Label>{t("password")}</Label>
                 <Input data-testid="login-password" type="password" required value={password} onChange={(e) => setPassword(e.target.value)} className="mt-1 rounded-xl" placeholder="••••••••" />
               </div>
+              {needs2FA && (
+                <div>
+                  <Label className="flex items-center gap-2"><ShieldCheck className="h-4 w-4 text-emerald-600" /> Код Google Authenticator</Label>
+                  <Input data-testid="login-otp" value={otp} onChange={(e) => setOtp(e.target.value)} className="mt-1 rounded-xl tracking-widest text-center" placeholder="123 456" inputMode="numeric" maxLength={6} autoFocus />
+                </div>
+              )}
               <Button data-testid="login-submit" disabled={busy} className="w-full rounded-full bg-blue-600 hover:bg-blue-700">{busy ? "..." : t("login_btn")}</Button>
             </form>
           </TabsContent>
