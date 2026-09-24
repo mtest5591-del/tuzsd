@@ -13,7 +13,6 @@ export default function Checkout() {
   const [inv, setInv] = useState(null);
   const [meta, setMeta] = useState({ cur: {}, net: {} });
   const [pay, setPay] = useState(null);
-  const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -34,12 +33,6 @@ export default function Checkout() {
   const select = async (iso, network_id) => {
     try { const { data } = await api.post(`/checkout/${id}/select`, { iso, network_id }); setPay(data.data); }
     catch (e) { toast.error(apiErr(e)); }
-  };
-  const simulate = async () => {
-    setBusy(true);
-    try { const { data } = await api.post(`/checkout/${id}/simulate-pay`); setInv({ ...inv, status: data.data.status }); toast.success(t("paid")); }
-    catch (e) { toast.error(apiErr(e)); }
-    finally { setBusy(false); }
   };
 
   if (!inv) return <div className="flex min-h-screen items-center justify-center text-slate-400">…</div>;
@@ -103,7 +96,10 @@ export default function Checkout() {
               </div>
             </div>
             <div className="flex items-center justify-center gap-2 text-sm text-amber-600"><Clock className="h-4 w-4" />{t("waiting")}</div>
-            <Button data-testid="simulate-pay-btn" disabled={busy} onClick={simulate} className="w-full rounded-full" style={{ background: brand }}>{t("simulate_pay")}</Button>
+            <div className="rounded-xl bg-blue-50 border border-blue-100 p-3 text-xs text-blue-900 space-y-1">
+              <div className="font-semibold">🔗 Реальний on-chain платіж</div>
+              <div>Надішліть точну суму <b>{fmtCrypto(pay.amount_to_pay)} {pay.currency}</b> на вказану адресу в мережі <b>{pay.network}</b>. Транзакція автоматично підтвердиться після появи в блокчейні (Alchemy / TronGrid моніторять адресу).</div>
+            </div>
           </div>
         )}
       </div>

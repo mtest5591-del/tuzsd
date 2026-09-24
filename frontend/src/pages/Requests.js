@@ -18,14 +18,23 @@ import {
 export default function Requests() {
   const { t } = useLang();
   const [invoices, setInvoices] = useState([]);
+  const [cryptos, setCryptos] = useState([]);
   const [open, setOpen] = useState(false);
   const [orderId, setOrderId] = useState("");
   const [price, setPrice] = useState("");
-  const [cur, setCur] = useState("USD");
+  const [cur, setCur] = useState("USDT");
   const [desc, setDesc] = useState("");
 
   const load = () => api.get("/invoices").then((r) => setInvoices(r.data.data)).catch(() => {});
-  useEffect(() => { load(); }, []);
+  useEffect(() => {
+    load();
+    api.get("/currencies").then((r) => {
+      const list = r.data.data || [];
+      setCryptos(list);
+      if (list.length && !list.find((c) => c.iso === cur)) setCur(list[0].iso);
+    }).catch(() => {});
+    // eslint-disable-next-line
+  }, []);
 
   const create = async () => {
     try {
@@ -59,7 +68,13 @@ export default function Requests() {
                 <div><Label>{t("currency")}</Label>
                   <Select value={cur} onValueChange={setCur}>
                     <SelectTrigger data-testid="inv-currency" className="rounded-xl mt-1"><SelectValue /></SelectTrigger>
-                    <SelectContent className="bg-white border border-slate-200">{["USD", "EUR", "UAH"].map((c) => <SelectItem key={c} value={c}>{c}</SelectItem>)}</SelectContent>
+                    <SelectContent className="bg-white border border-slate-200">
+                      {cryptos.map((c) => (
+                        <SelectItem key={c.iso} value={c.iso}>
+                          {c.iso} — {c.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
                   </Select>
                 </div>
               </div>

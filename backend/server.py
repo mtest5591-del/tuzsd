@@ -464,17 +464,36 @@ class InvoiceIn(BaseModel):
 
 async def _create_invoice(user, merchant, data: dict) -> dict:
     inv_id = gen_id()
+    # Currency the merchant expects payment IN (crypto ticker like USDT/BTC/ETH).
+    pci = (data.get("payment_currency_iso") or "USDT").upper()
+    if pci not in CURRENCIES:
+        raise HTTPException(400, f"payment_currency_iso must be one of: {', '.join(CURRENCIES.keys())}")
+    # Build accepted (iso, network) pairs — filter out networks disabled by superadmin
     curs = data.get("currencies") or []
+    net_settings = await db.system.find_one({"_id": "network_settings"}) or {"enabled": {}}
+    enabled_map = net_settings.get("enabled", {})
     if not curs:
         curs = []
         for iso, c in CURRENCIES.items():
             for nid in c["networks"]:
-                curs.append({"iso": iso, "network": nid})
+                if enabled_map.get(str(nid), True):
+                    curs.append({"iso": iso, "network": nid})
+    else:
+        # Validate + filter by admin-enabled networks
+        filtered = []
+        for row in curs:
+            iso = row.get("iso", "").upper()
+            nid = int(row.get("network"))
+            if iso in CURRENCIES and nid in CURRENCIES[iso]["networks"] and enabled_map.get(str(nid), True):
+                filtered.append({"iso": iso, "network": nid})
+        curs = filtered
+    if not curs:
+        raise HTTPException(400, "Немає доступних мереж — усі вимкнено суперадміністратором")
     order_id = data.get("order_id") or gen_id(6)
     frontend = os.environ.get("FRONTEND_URL", "")
     inv = {
         "id": inv_id, "user_id": user["user_id"], "merchant_id": merchant["merchant_id"],
-        "order_id": str(order_id), "payment_currency_iso": data.get("payment_currency_iso", "USD"),
+        "order_id": str(order_id), "payment_currency_iso": pci,
         "price": float(data.get("price", 0)), "include_commission": int(data.get("include_commission", 1)),
         "description": data.get("description", ""), "status_id": 0, "status": "Created",
         "currencies": curs, "link": f"{frontend}/checkout/{inv_id}",
@@ -616,16 +635,27 @@ async def checkout_select(inv_id: str, payload: CheckoutSelectIn):
     iso = payload.iso.upper()
     if iso not in CURRENCIES or payload.network_id not in CURRENCIES[iso]["networks"]:
         raise HTTPException(400, "Currency/network not available")
+    if not await is_network_enabled(payload.network_id):
+        net_name = NETWORKS.get(payload.network_id, {}).get("name", str(payload.network_id))
+        raise HTTPException(400, f"Мережа {net_name} тимчасово вимкнена")
     addr = await allocate_address(inv["user_id"], iso, payload.network_id, invoice_id=inv_id)
-    usd = inv["price"] * FIAT_RATES_USD.get(inv["payment_currency_iso"], 1.0)
-    amount = usd / PRICES_USD[iso]
+    # Convert invoice price (denominated in a crypto ISO) to the chosen payment ISO via USD parity.
+    pay_iso = (inv.get("payment_currency_iso") or "USDT").upper()
+    if pay_iso not in PRICES_USD:
+        raise HTTPException(400, f"Invoice currency {pay_iso} not supported")
+    usd = float(inv["price"]) * PRICES_USD[pay_iso]
+    amount = usd / PRICES_USD[iso] if PRICES_USD[iso] else 0.0
     merchant = await db.merchants.find_one({"merchant_id": inv["merchant_id"]}, {"_id": 0})
     infee = resolve_fee(merchant, iso, "in")
     merchant_fee = amount * infee["percent"] / 100 + infee["fixed"]
-    amount_to_pay = amount + merchant_fee
+    # Include platform deposit fee in the amount the payer must send so recipient credit stays whole
+    plat = await get_platform_settings()
+    platform_fee = float(plat.get("deposit_fee") or 0.0)
+    amount_to_pay = amount + merchant_fee + platform_fee
     net = NETWORKS[payload.network_id]
     pay_info = {"amount": round(amount, 8), "merchant_fee": round(merchant_fee, 8),
-                "commission": round(merchant_fee, 8),
+                "platform_fee": round(platform_fee, 8),
+                "commission": round(merchant_fee + platform_fee, 8),
                 "amount_to_pay": round(amount_to_pay, 8), "address": addr["address"],
                 "currency": iso, "network": net["name"], "network_id": payload.network_id,
                 "network_iso": net["iso"], "rate": PRICES_USD[iso]}
@@ -633,32 +663,29 @@ async def checkout_select(inv_id: str, payload: CheckoutSelectIn):
     return {"status": True, "data": pay_info}
 
 
-@cab.post("/checkout/{inv_id}/simulate-pay")
-async def checkout_simulate(inv_id: str):
-    """DEMO: simulate a confirmed on-chain payment for the selected currency."""
-    inv = await db.invoices.find_one({"id": inv_id}, {"_id": 0})
-    if not inv:
-        raise HTTPException(404, "Invoice not found")
-    if not inv.get("pay_info"):
-        raise HTTPException(400, "Select a payment currency first")
-    if inv["status"] in ("Paid", "Completed"):
-        return {"status": True, "data": invoice_public(inv)}
-    pi = inv["pay_info"]
-    iso, nid, amount = pi["currency"], pi["network_id"], pi["amount"]
-    await credit_balance(inv["user_id"], iso, amount)
-    await add_transaction(inv["user_id"], "deposit", iso, nid, amount, status="Done",
-                          address=pi["address"], txid="0x" + uuid.uuid4().hex,
-                          description=f"Deposit Invoice #{inv['id']}", invoice_id=inv_id,
-                          order_id=inv["order_id"])
-    await db.invoices.update_one({"id": inv_id}, {"$set": {
-        "status": "Paid", "status_id": 8, "amount_paid": amount,
-        "usd_value": round(amount * PRICES_USD[iso], 2)}})
-    inv["status"] = "Paid"
-    merchant = await db.merchants.find_one({"merchant_id": inv["merchant_id"]}, {"_id": 0})
-    if merchant:
-        await send_webhook(merchant, inv, iso, amount)
-    inv2 = await db.invoices.find_one({"id": inv_id}, {"_id": 0})
-    return {"status": True, "data": invoice_public(inv2)}
+@cab.post("/checkout/{inv_id}/simulate-pay", deprecated=True)
+async def checkout_simulate_removed(inv_id: str):
+    """Симуляція оплат ВИМКНЕНА — всі платежі приймаються тільки з реального блокчейну."""
+    raise HTTPException(410, "Симуляція оплат вимкнена. Надішліть реальні кошти на адресу checkout — deposit worker підтвердить транзакцію on-chain (Alchemy/TronGrid).")
+
+
+@cab.get("/currencies")
+async def crypto_currency_list(request: Request):
+    """List of CRYPTO currencies available for invoices/deposits (fiat removed)."""
+    await get_current_user(request)
+    net_settings = await db.system.find_one({"_id": "network_settings"}) or {"enabled": {}}
+    enabled_map = net_settings.get("enabled", {})
+    out = []
+    for iso, c in CURRENCIES.items():
+        nets = []
+        for nid in c["networks"]:
+            if enabled_map.get(str(nid), True):
+                nm = NETWORKS[nid]
+                nets.append({"network_id": nid, "network_iso": nm["iso"], "name": nm["name"], "chain": nm["chain"]})
+        if nets:
+            out.append({"iso": iso, "name": c["name"], "color": c["color"], "networks": nets,
+                        "price_usd": PRICES_USD.get(iso, 0)})
+    return {"status": True, "data": out}
 
 
 # ============================ public okipays API ============================
@@ -667,7 +694,10 @@ pub = APIRouter(prefix="/api/v1/public")
 
 @pub.get("/currency-list")
 async def currency_list():
-    return {"status": True, "data": FIAT_CURRENCIES}
+    """Public list of CRYPTO ISOs supported for invoices (fiat is deprecated)."""
+    return {"status": True, "data": [
+        {"id": CURRENCIES[iso]["id"], "name": CURRENCIES[iso]["name"], "iso3": iso}
+        for iso in CURRENCIES]}
 
 
 @pub.get("/currency-network-list")
