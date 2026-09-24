@@ -303,10 +303,24 @@ function SecurityTab({ onChanged }) {
 function PlatformTab({ user }) {
   const [pf, setPf] = useState(null);
   const [otp, setOtp] = useState("");
-  useEffect(() => {
+  const [treasury, setTreasury] = useState(null);
+  const [labels, setLabels] = useState({});
+  const [addrs, setAddrs] = useState({});
+  const [pool, setPool] = useState([]);
+  const [poolOtp, setPoolOtp] = useState("");
+
+  const loadAll = () => {
     api.get("/admin/platform-fees").then((r) => setPf(r.data.data)).catch((e) => toast.error(apiErr(e)));
-  }, []);
-  if (!pf) return <div className="text-slate-400">…</div>;
+    api.get("/admin/treasury-addresses").then((r) => {
+      setTreasury(r.data.data);
+      setLabels(r.data.data.labels);
+      setAddrs(r.data.data.addresses || {});
+    }).catch(() => {});
+    api.get("/admin/pool").then((r) => setPool(r.data.data)).catch(() => {});
+  };
+  useEffect(() => { loadAll(); }, []);
+  if (!pf || !treasury) return <div className="text-slate-400">…</div>;
+
   const save = async () => {
     try {
       const { data } = await api.put("/admin/platform-fees", {
@@ -319,16 +333,34 @@ function PlatformTab({ user }) {
       toast.success("Комісії платформи оновлено");
     } catch (e) { toast.error(apiErr(e)); }
   };
-  const pool = pf.pool_by_iso || {};
-  const poolEntries = Object.entries(pool).filter(([, v]) => v > 0);
+
+  const saveTreasury = async () => {
+    try {
+      const { data } = await api.put("/admin/treasury-addresses", { addresses: addrs, otp: otp || undefined });
+      setAddrs(data.data);
+      toast.success("Treasury-адреси збережено");
+    } catch (e) { toast.error(apiErr(e)); }
+  };
+
+  const withdrawPool = async (key) => {
+    try {
+      const { data } = await api.post("/admin/pool/withdraw", { key, otp: poolOtp || undefined });
+      toast.success(`Заявку створено: ${data.data.amount} ${data.data.iso} → ${data.data.chain}`);
+      setPoolOtp("");
+      loadAll();
+    } catch (e) { toast.error(apiErr(e)); }
+  };
+
   return (
-    <div className="space-y-5 max-w-3xl">
+    <div className="space-y-5 max-w-4xl">
       <div className="rounded-2xl border border-emerald-100 bg-gradient-to-br from-emerald-50/60 to-transparent p-5">
         <div className="text-sm text-emerald-800 font-semibold mb-1">👑 Тільки для суперадміністратора MaksPay</div>
         <div className="text-xs text-slate-600">Ці комісії застосовуються глобально до всіх мерчантів/користувачів платформи. Джерело доходу.</div>
       </div>
 
+      {/* Fees */}
       <div className="rounded-2xl border border-slate-100 p-5 space-y-4">
+        <div className="text-lg font-bold text-slate-900">Комісії</div>
         <div>
           <Label className="text-slate-700 font-semibold">Комісія на вхід (депозит) — {pf.deposit_fee} USDT (flat)</Label>
           <Input data-testid="pf-deposit" type="number" step="0.01" value={pf.deposit_fee} onChange={(e) => setPf({ ...pf, deposit_fee: e.target.value })} className="rounded-xl mt-1 max-w-xs" />
@@ -337,34 +369,87 @@ function PlatformTab({ user }) {
         <div>
           <Label className="text-slate-700 font-semibold">Комісія на вивід (з особистого кабінету)</Label>
           <Input data-testid="pf-wd-cab" type="number" step="0.01" value={pf.withdrawal_fee_cabinet} onChange={(e) => setPf({ ...pf, withdrawal_fee_cabinet: e.target.value })} className="rounded-xl mt-1 max-w-xs" />
-          <p className="text-xs text-slate-400 mt-1">Стандартна комісія для прямого виводу з кабінету.</p>
         </div>
         <div>
           <Label className="text-slate-700 font-semibold">Комісія на вивід через API</Label>
           <Input data-testid="pf-wd-api" type="number" step="0.01" value={pf.withdrawal_fee_api} onChange={(e) => setPf({ ...pf, withdrawal_fee_api: e.target.value })} className="rounded-xl mt-1 max-w-xs" />
-          <p className="text-xs text-slate-400 mt-1">Для API-виводів (автоматичні перекази від мерчантів).</p>
         </div>
         {user?.two_fa?.enabled && (
           <div>
-            <Label className="flex items-center gap-2"><ShieldCheck className="h-4 w-4 text-emerald-600" /> Код Google Authenticator</Label>
+            <Label className="flex items-center gap-2"><ShieldCheck className="h-4 w-4 text-emerald-600" /> Код 2FA</Label>
             <Input data-testid="pf-otp" value={otp} onChange={(e) => setOtp(e.target.value)} placeholder="123 456" className="rounded-xl mt-1 max-w-xs" inputMode="numeric" maxLength={6} />
           </div>
         )}
         <div className="flex justify-end">
-          <Button data-testid="pf-save" onClick={save} className="rounded-full bg-emerald-600 hover:bg-emerald-700 px-8">Зберегти</Button>
+          <Button data-testid="pf-save" onClick={save} className="rounded-full bg-emerald-600 hover:bg-emerald-700 px-8">Зберегти комісії</Button>
         </div>
       </div>
 
-      <div className="rounded-2xl border border-slate-100 p-5">
-        <div className="text-sm text-slate-500 mb-2">💰 Пул платформи (накопичені комісії)</div>
-        {poolEntries.length === 0 ? (
-          <div className="text-sm text-slate-400">Ще нічого не накопичено</div>
+      {/* Treasury addresses per chain */}
+      <div className="rounded-2xl border border-slate-100 p-5 space-y-4">
+        <div>
+          <div className="text-lg font-bold text-slate-900">🏦 Гаманці для отримання комісій (по мережах)</div>
+          <div className="text-sm text-slate-500 mt-1">Комісії платформи в кожній мережі накопичуються та виводяться на відповідну вашу адресу.</div>
+        </div>
+        <div className="grid md:grid-cols-2 gap-3">
+          {Object.entries(labels).map(([chain, label]) => (
+            <div key={chain} className="rounded-xl bg-slate-50 border border-slate-100 p-3">
+              <Label className="text-xs text-slate-500">{label}</Label>
+              <Input
+                data-testid={`treasury-${chain}`}
+                value={addrs[chain] || ""}
+                onChange={(e) => setAddrs({ ...addrs, [chain]: e.target.value })}
+                placeholder={chain === "tron" ? "T..." : chain === "bitcoin" ? "bc1... / 1... / 3..." : chain === "litecoin" ? "ltc1... / L... / M..." : chain === "solana" ? "Solana address" : "0x..."}
+                className="rounded-lg mt-1 font-mono text-xs"
+              />
+            </div>
+          ))}
+        </div>
+        <div className="flex justify-end">
+          <Button data-testid="treasury-save" onClick={saveTreasury} className="rounded-full">Зберегти адреси</Button>
+        </div>
+      </div>
+
+      {/* Pool */}
+      <div className="rounded-2xl border border-emerald-100 p-5 space-y-3">
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="text-lg font-bold text-slate-900">💵 Пул платформи (доступно до виводу)</div>
+            <div className="text-sm text-slate-500 mt-1">Комісії, накопичені по кожній валюті та мережі. Натисніть "Вивести" щоб надіслати на відповідну treasury-адресу.</div>
+          </div>
+          {user?.two_fa?.enabled && pool.length > 0 && (
+            <div className="max-w-[160px]">
+              <Label className="text-xs">2FA код</Label>
+              <Input data-testid="pool-otp" value={poolOtp} onChange={(e) => setPoolOtp(e.target.value)} placeholder="123 456" className="rounded-lg mt-1" inputMode="numeric" maxLength={6} />
+            </div>
+          )}
+        </div>
+        {pool.length === 0 ? (
+          <div className="text-sm text-slate-400 py-4">Ще нічого не накопичено. Комісії з'являться після перших транзакцій.</div>
         ) : (
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-            {poolEntries.map(([iso, v]) => (
-              <div key={iso} className="rounded-xl bg-slate-50 border p-3">
-                <div className="text-xs text-slate-500">{iso}</div>
-                <div className="text-lg font-bold text-emerald-700">{Number(v).toFixed(6)}</div>
+          <div className="space-y-2">
+            {pool.map((row) => (
+              <div key={row.key} className="flex items-center justify-between rounded-xl border border-slate-100 p-3 hover:bg-slate-50">
+                <div className="flex items-center gap-3">
+                  <CoinIcon iso={row.iso} size={30} />
+                  <div>
+                    <div className="font-semibold text-slate-900">{row.amount.toFixed(6)} {row.iso}</div>
+                    <div className="text-xs text-slate-500">{row.network_name} · {row.chain}</div>
+                    {row.treasury_address ? (
+                      <div className="text-[10px] text-slate-400 font-mono mt-1">→ {row.treasury_address}</div>
+                    ) : (
+                      <div className="text-[11px] text-orange-600 mt-1">⚠️ Не задано treasury для {row.chain}</div>
+                    )}
+                  </div>
+                </div>
+                <Button
+                  data-testid={`pool-wd-${row.key}`}
+                  onClick={() => withdrawPool(row.key)}
+                  disabled={!row.withdrawable}
+                  className="rounded-full bg-emerald-600 hover:bg-emerald-700"
+                >
+                  Вивести
+                </Button>
               </div>
             ))}
           </div>

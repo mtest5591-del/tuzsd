@@ -31,7 +31,13 @@ DEFAULT_PLATFORM = {
     "deposit_fee": 0.5,               # flat, deducted from incoming amount (in the incoming currency units, e.g. USDT)
     "withdrawal_fee_cabinet": 1.0,    # flat, added on top of user amount for direct-cabinet withdrawals
     "withdrawal_fee_api": 0.8,        # flat, for API-driven withdrawals (merchant integrations)
-    "pool_by_iso": {},                # accumulated fees pool per currency iso (e.g. {"USDT": 12.5})
+    # pool broken down by iso -> network_id -> amount (so we know which chain the funds sit on)
+    "pool_by_key": {},
+    # per-chain treasury addresses (EVM taken from env TREASURY_EVM; here we store TRON/SOL/BTC/LTC + overrides)
+    "treasury_addresses": {
+        "ethereum": "", "bsc": "", "polygon": "", "arbitrum": "",  # EVM (default from env if empty)
+        "tron": "", "solana": "", "bitcoin": "", "litecoin": "",
+    },
 }
 
 DEFAULT_NETWORKS_DOC_ID = "network_settings"
@@ -42,9 +48,22 @@ async def get_platform_settings() -> dict:
     if not s:
         await db.system.insert_one(dict(DEFAULT_PLATFORM))
         s = dict(DEFAULT_PLATFORM)
-    # ensure all keys exist
+    # ensure all keys exist (schema evolution)
     for k, v in DEFAULT_PLATFORM.items():
-        s.setdefault(k, v)
+        if k == "_id":
+            continue
+        if k not in s:
+            s[k] = v
+        elif isinstance(v, dict):
+            for kk, vv in v.items():
+                s.setdefault(k, {}).setdefault(kk, vv)
+    # inject env EVM treasury as default if not overridden
+    import os as _os
+    env_evm = _os.environ.get("TREASURY_EVM", "").strip()
+    if env_evm:
+        for chain in ("ethereum", "bsc", "polygon", "arbitrum"):
+            if not s["treasury_addresses"].get(chain):
+                s["treasury_addresses"][chain] = env_evm
     return s
 
 
@@ -54,12 +73,13 @@ async def update_platform_settings(patch: dict) -> dict:
     return await get_platform_settings()
 
 
-async def add_to_pool(iso: str, amount: float):
+async def add_to_pool(iso: str, amount: float, network_id=None):
     if not amount:
         return
+    key = f"{iso}:{network_id}" if network_id is not None else f"{iso}:_"
     await db.system.update_one(
         {"_id": "platform_settings"},
-        {"$inc": {f"pool_by_iso.{iso}": float(amount)}},
+        {"$inc": {f"pool_by_key.{key}": float(amount)}},
         upsert=True,
     )
 
@@ -172,6 +192,159 @@ async def platform_fees_public(request: Request):
         "withdrawal_fee_cabinet": s["withdrawal_fee_cabinet"],
         "withdrawal_fee_api": s["withdrawal_fee_api"],
     }}
+
+
+# ---------------------------------------------------------------------------
+# Treasury addresses (per chain) and pool withdrawal
+# ---------------------------------------------------------------------------
+CHAIN_LABELS = {
+    "ethereum": "Ethereum (ERC20)",
+    "bsc": "BSC (BEP20)",
+    "polygon": "Polygon",
+    "arbitrum": "Arbitrum",
+    "tron": "Tron (TRC20)",
+    "solana": "Solana",
+    "bitcoin": "Bitcoin",
+    "litecoin": "Litecoin",
+}
+
+
+class TreasuryIn(BaseModel):
+    addresses: dict  # {chain: address, ...}
+    otp: Optional[str] = None
+
+
+@admin_router.get("/treasury-addresses")
+async def treasury_get(request: Request):
+    user = await _require_superadmin(request)
+    s = await get_platform_settings()
+    return {"status": True, "data": {
+        "addresses": s.get("treasury_addresses", {}),
+        "labels": CHAIN_LABELS,
+    }}
+
+
+@admin_router.put("/treasury-addresses")
+async def treasury_put(request: Request, payload: TreasuryIn):
+    user = await _require_superadmin(request)
+    if (user.get("two_fa") or {}).get("enabled"):
+        if not await check_user_2fa(user, payload.otp):
+            raise HTTPException(401, "Потрібен коректний код 2FA")
+    # normalize & sanity check
+    addr_patch = {}
+    for chain, addr in (payload.addresses or {}).items():
+        if chain not in CHAIN_LABELS:
+            continue
+        addr = (addr or "").strip()
+        addr_patch[f"treasury_addresses.{chain}"] = addr
+    if addr_patch:
+        await db.system.update_one({"_id": "platform_settings"},
+                                   {"$set": addr_patch}, upsert=True)
+    s = await get_platform_settings()
+    return {"status": True, "data": s.get("treasury_addresses", {})}
+
+
+# Show pool broken down per iso+network
+@admin_router.get("/pool")
+async def pool_get(request: Request):
+    user = await _require_superadmin(request)
+    s = await get_platform_settings()
+    pool = s.get("pool_by_key", {}) or {}
+    treasury = s.get("treasury_addresses", {}) or {}
+    items = []
+    for key, amount in pool.items():
+        try:
+            iso, nid_str = key.split(":", 1)
+            nid = int(nid_str) if nid_str != "_" else None
+        except Exception:
+            continue
+        net = NETWORKS.get(nid, {}) if nid is not None else {}
+        chain = net.get("chain")
+        tres_addr = treasury.get(chain, "") if chain else ""
+        items.append({
+            "key": key,
+            "iso": iso,
+            "network_id": nid,
+            "network_name": net.get("name") or "—",
+            "chain": chain or "—",
+            "amount": float(amount or 0),
+            "treasury_address": tres_addr,
+            "withdrawable": bool(tres_addr) and float(amount or 0) > 0,
+        })
+    items.sort(key=lambda x: (x["chain"], x["iso"]))
+    return {"status": True, "data": items}
+
+
+class PoolWithdrawIn(BaseModel):
+    key: str  # "USDT:2"
+    otp: Optional[str] = None
+
+
+@admin_router.post("/pool/withdraw")
+async def pool_withdraw(request: Request, payload: PoolWithdrawIn):
+    user = await _require_superadmin(request)
+    if (user.get("two_fa") or {}).get("enabled"):
+        if not await check_user_2fa(user, payload.otp):
+            raise HTTPException(401, "Потрібен коректний код 2FA")
+    s = await get_platform_settings()
+    pool = s.get("pool_by_key", {}) or {}
+    amount = float(pool.get(payload.key, 0) or 0)
+    if amount <= 0:
+        raise HTTPException(400, "Немає коштів у пулі за цим ключем")
+    try:
+        iso, nid_str = payload.key.split(":", 1)
+        nid = int(nid_str) if nid_str != "_" else None
+    except Exception:
+        raise HTTPException(400, "Невірний ключ пулу")
+    net = NETWORKS.get(nid, {}) if nid is not None else {}
+    chain = net.get("chain")
+    treasury = (s.get("treasury_addresses") or {}).get(chain, "")
+    if not treasury:
+        raise HTTPException(400, f"Не задано treasury-адресу для мережі {chain or '?'}. Спочатку налаштуйте у розділі Платформа → Гаманці.")
+    # Reset the pool entry (accounting) and record a pending platform_withdrawal transaction.
+    # Actual on-chain send is performed by the platform operator using the hot-wallet private key
+    # (or via the sweep worker in a future iteration).
+    await db.system.update_one(
+        {"_id": "platform_settings"},
+        {"$unset": {f"pool_by_key.{payload.key}": ""}},
+    )
+    tx = {
+        "tx_id": __import__("uuid").uuid4().hex[:12],
+        "user_id": "platform",
+        "type": "platform_fee_withdraw",
+        "iso": iso,
+        "network_id": nid,
+        "amount": round(amount, 8),
+        "fee": 0,
+        "fee_iso": iso,
+        "gross_amount": round(amount, 8),
+        "usd_value": 0,
+        "status": "Pending",
+        "address": treasury,
+        "txid": None,
+        "description": f"Platform fee → treasury ({chain})",
+        "order_id": None,
+        "invoice_id": None,
+        "created_ts": int(__import__("time").time()),
+        "created_at": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+        "source": "platform",
+    }
+    await db.transactions.insert_one(dict(tx))
+    tx.pop("_id", None)
+    logger.info(f"Platform pool withdraw queued: {amount} {iso} @{chain} → {treasury}")
+    return {"status": True, "data": {"transaction": tx, "amount": amount, "iso": iso,
+                                     "chain": chain, "treasury": treasury,
+                                     "note": "Заявку створено. Фізичний on-chain переказ виконується оператором вручну або воркером свипу."}}
+
+
+# List platform fee transactions (superadmin view)
+@admin_router.get("/pool/history")
+async def pool_history(request: Request):
+    user = await _require_superadmin(request)
+    txs = await db.transactions.find(
+        {"user_id": "platform"}, {"_id": 0}
+    ).sort("created_ts", -1).to_list(200)
+    return {"status": True, "data": txs}
 
 
 # ---------------------------------------------------------------------------

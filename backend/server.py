@@ -410,7 +410,7 @@ async def withdraw(request: Request, payload: WithdrawIn):
     if total > bal["balance_available"]:
         raise HTTPException(400, "Недостатньо коштів на балансі (з урахуванням комісії)")
     await credit_balance(uid, iso, -total)
-    await add_to_pool(iso, platform_fee)
+    await add_to_pool(iso, platform_fee, network_id=payload.network_id)
     tx = await add_transaction(uid, "withdraw", iso, payload.network_id, payload.amount,
                                status="Pending", address=payload.address,
                                description=f"Withdraw {iso} (комісія {total_fee} {iso})",
@@ -993,7 +993,7 @@ async def _confirm_payment(inv, iso, nid, amount, address, status, sid, from_add
     if not review_hold:
         await credit_balance(inv["user_id"], iso, net_amount)
     if fee_applied > 0:
-        await add_to_pool(iso, fee_applied)
+        await add_to_pool(iso, fee_applied, network_id=nid)
     tx_status = "Review" if review_hold else "Done"
     await add_transaction(inv["user_id"], "deposit", iso, nid, net_amount, status=tx_status,
                           address=address, txid="onchain",
