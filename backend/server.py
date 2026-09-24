@@ -801,7 +801,8 @@ async def order_create(request: Request):
     curs = []
     for c in body.get("currencies", []) or []:
         curs.append({"iso": str(c.get("iso", "")).upper(), "network": c.get("network")})
-    data = {"order_id": body.get("order_id"), "payment_currency_iso": body.get("payment_currency_iso", "USD"),
+    pci = str(body.get("payment_currency_iso") or "USDT").upper()
+    data = {"order_id": body.get("order_id"), "payment_currency_iso": pci,
             "price": body.get("price", 0), "include_commission": body.get("include_commission", 1),
             "description": body.get("description", ""), "currencies": curs,
             "time_expired": body.get("time_expired", 0), "redirect_url": body.get("redirect_url", "")}
@@ -843,6 +844,9 @@ async def merchant_pay_in(request: Request):
     nid = _resolve_network(iso, body.get("network"))
     if iso not in CURRENCIES or nid is None:
         raise HTTPException(400, "Currency not available")
+    if not await is_network_enabled(nid):
+        net_name = NETWORKS.get(nid, {}).get("name", str(nid))
+        raise HTTPException(400, f"Мережа {net_name} тимчасово вимкнена суперадміністратором")
     amount = float(body.get("amount", 0))
     data = {"order_id": body.get("order_id") or gen_id(6), "payment_currency_iso": iso,
             "price": amount, "include_commission": body.get("include_commission", 0),
@@ -853,9 +857,14 @@ async def merchant_pay_in(request: Request):
     addr = await allocate_address(user["user_id"], iso, nid, invoice_id=inv["id"])
     infee = resolve_fee(merchant, iso, "in")
     merchant_fee = amount * infee["percent"] / 100 + infee["fixed"]
-    amount_to_pay = amount + merchant_fee
+    # Include platform fee so the recipient credit stays whole after platform deducts it
+    plat = await get_platform_settings()
+    platform_fee = float(plat.get("deposit_fee") or 0.0)
+    amount_to_pay = amount + merchant_fee + platform_fee
     net = NETWORKS[nid]
-    pay_info = {"commission": round(merchant_fee, 8), "merchant_fee": round(merchant_fee, 8),
+    pay_info = {"commission": round(merchant_fee + platform_fee, 8),
+                "merchant_fee": round(merchant_fee, 8),
+                "platform_fee": round(platform_fee, 8),
                 "amount_to_pay": round(amount_to_pay, 8),
                 "amount": round(amount, 8), "address": addr["address"],
                 "currency": iso, "network": net["name"], "network_id": nid, "rate": PRICES_USD[iso]}
